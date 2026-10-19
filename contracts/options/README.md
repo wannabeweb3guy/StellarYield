@@ -14,6 +14,7 @@
 - `deposit(owner, asset, amount)` / `withdraw(owner, asset, amount)`
 - `get_free_collateral(owner, asset)` / `get_reserved_collateral(owner, asset)`
 - `get_premium(spot, strike, time_to_expiry_years, iv)`
+- `set_oracle_max_age(max_age)` / `clear_oracle_max_age()` / `get_oracle_max_age()` (oracle guard, admin only to change)
 
 ## Events
 
@@ -47,9 +48,25 @@ Positions minted before reserve tracking existed have no recorded reserve;
 releasing their collateral saturates at zero. Their collateral was never in the
 free bucket, so it was never withdrawable.
 
+## Oracle Freshness Guard
+
+Once the admin calls `set_oracle_max_age(max_age)`, `mint` consults the oracle
+configured in `initialize` before taking or reserving any collateral. The oracle
+must expose `get_price(asset) -> Option<(price, observed_at)>`. An observation is
+required for the underlying asset and, when it differs, the collateral asset
+(the quote asset for puts). `mint` fails with:
+
+- `OracleObservationMissing` if the oracle has no observation for the asset,
+- `InvalidPrice` if the price is not positive or `observed_at` is zero or in the future,
+- `StaleOracleObservation` if the observation is older than `max_age` seconds.
+
+A rejected mint moves no funds and consumes no option id. Until the guard is
+enabled (or after `clear_oracle_max_age`), `mint` does not call the oracle, so
+existing deployments behave exactly as before.
+
 ## Storage Model
 
-- Instance: admin, oracle, option counter.
+- Instance: admin, oracle, option counter, oracle guard max age.
 - Persistent: option records by id, free and reserved collateral per `(owner, asset)`, and the amount already paid out by partial exercises per option.
 
 ## Local Test

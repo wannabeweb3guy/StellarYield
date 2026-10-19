@@ -8,6 +8,8 @@ pub enum DataKey {
     OptionCounter,
     Option(u32),
     StorageVersion,
+    /// Maximum accepted age, in seconds, of an oracle observation used by `mint`.
+    OracleMaxAge,
     /// Collateral already paid out by partial exercises of an option. Kept apart
     /// from `OptionData` so existing stored records keep decoding unchanged.
     ExercisedAmount(u32),
@@ -195,4 +197,20 @@ pub fn write_position_collateral(e: &Env, option_id: u32, position_id: u32, amou
     let key = DataKey::PositionCollateral(option_id, position_id);
     e.storage().persistent().set(&key, &amount);
     extend_persistent_ttl_default(e, @key);
+}
+
+/// `None` means the oracle guard is not enabled and `mint` does not consult the oracle.
+pub fn read_oracle_max_age(e: &Env) -> Option<u64> {
+    extend_instance_ttl_default(e);
+    e.storage().instance().get(&DataKey::OracleMaxAge)
+}
+
+pub fn write_oracle_max_age(e: &Env, max_age: u64) {
+    e.storage().instance().set(&DataKey::OracleMaxAge, &max_age);
+    extend_instance_ttl_default(e);
+}
+
+pub fn clear_oracle_max_age(e: &Env) {
+    e.storage().instance().remove(&DataKey::OracleMaxAge);
+    extend_instance_ttl_default(e);
 }

@@ -766,3 +766,259 @@ fn test_reserve_is_tracked_per_owner() {
     );
     client.withdraw(&other, &underlying, &3_000_000);
 }
+
+// ── Oracle freshness guard on mint ────────────────────────────────────────
+
+use soroban_sdk::{contract, contractimpl, contracttype};
+
+#[contracttype]
+enum MockKey {
+    Price(Address),
+}
+
+/// Minimal price source returning whatever the test last stored.
+#[contract]
+struct MockOracle;
+
+#[contractimpl]
+impl MockOracle {
+    pub fn set_price(env: Env, asset: Address, price: i128, observed_at: u64) {
+        env.storage()
+            .instance()
+            .set(&MockKey::Price(asset), &(price, observed_at));
+    }
+
+    pub fn get_price(env: Env, asset: Address) -> Option<(i128, u64)> {
+        env.storage().instance().get(&MockKey::Price(asset))
+    }
+}
+
+const NOW: u64 = 10_000;
+const MAX_AGE: u64 = 900;
+
+struct OracleEnv {
+    env: Env,
+    client: OptionsContractClient<'static>,
+    oracle: MockOracleClient<'static>,
+    admin: Address,
+    underlying: Address,
+    quote: Address,
+}
+
+fn setup_oracle_env() -> OracleEnv {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(NOW);
+
+    let client = OptionsContractClient::new(&env, &env.register(OptionsContract, ()));
+    let oracle = MockOracleClient::new(&env, &env.register(MockOracle, ()));
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let underlying = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let quote = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    client.initialize(&admin, &oracle.address);
+
+    OracleEnv {
+        env,
+        client,
+        oracle,
+        admin,
+        underlying,
+        quote,
+    }
+}
+
+fn try_mint_call(t: &OracleEnv, minter: &Address) -> Result<u32, crate::OptionsError> {
+    match t.client.try_mint(
+        minter,
+        &OptionType::Call,
+        &t.underlying,
+        &t.quote,
+        &100_000_000_i128,
+        &500u64,
+        &1000u64,
+        &10_000_000_i128,
+    ) {
+        Ok(Ok(id)) => Ok(id),
+        Err(Ok(err)) => Err(err),
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+fn funded_minter(t: &OracleEnv) -> Address {
+    let minter = Address::generate(&t.env);
+    mint_tokens(&t.env, &t.underlying, &minter, 20_000_000);
+    mint_tokens(&t.env, &t.quote, &minter, 20_000_000);
+    minter
+}
+
+#[test]
+fn test_mint_ignores_oracle_until_guard_is_enabled() {
+    let t = setup_oracle_env();
+    let minter = funded_minter(&t);
+
+    // No observation at all, but the guard is off, so mint behaves as before.
+    assert_eq!(t.client.get_oracle_max_age(), None);
+    assert_eq!(try_mint_call(&t, &minter), Ok(1));
+}
+
+#[test]
+fn test_mint_accepts_fresh_observation() {
+    let t = setup_oracle_env();
+    let minter = funded_minter(&t);
+    t.client.set_oracle_max_age(&MAX_AGE);
+    assert_eq!(t.client.get_oracle_max_age(), Some(MAX_AGE));
+
+    t.oracle
+        .set_price(&t.underlying, &100_000_000, &(NOW - 100));
+    assert_eq!(try_mint_call(&t, &minter), Ok(1));
+}
+
+#[test]
+fn test_mint_accepts_observation_exactly_at_max_age() {
+    let t = setup_oracle_env();
+    let minter = funded_minter(&t);
+    t.client.set_oracle_max_age(&MAX_AGE);
+
+    t.oracle
+        .set_price(&t.underlying, &100_000_000, &(NOW - MAX_AGE));
+    assert_eq!(try_mint_call(&t, &minter), Ok(1));
+}
+
+#[test]
+fn test_mint_rejects_stale_observation_and_moves_no_funds() {
+    let t = setup_oracle_env();
+    let minter = funded_minter(&t);
+    t.client.set_oracle_max_age(&MAX_AGE);
+    let token = soroban_sdk::token::Client::new(&t.env, &t.underlying);
+
+    t.oracle
+        .set_price(&t.underlying, &100_000_000, &(NOW - MAX_AGE - 1));
+    assert_eq!(
+        try_mint_call(&t, &minter),
+        Err(crate::OptionsError::StaleOracleObservation)
+    );
+    assert_eq!(token.balance(&minter), 20_000_000);
+    assert_eq!(token.balance(&t.client.address), 0);
+
+    // A refreshed observation unblocks minting, and ids start at 1: the
+    // rejected attempt did not consume one.
+    t.oracle.set_price(&t.underlying, &100_000_000, &NOW);
+    assert_eq!(try_mint_call(&t, &minter), Ok(1));
+}
+
+#[test]
+fn test_mint_rejects_missing_observation() {
+    let t = setup_oracle_env();
+    let minter = funded_minter(&t);
+    t.client.set_oracle_max_age(&MAX_AGE);
+
+    assert_eq!(
+        try_mint_call(&t, &minter),
+        Err(crate::OptionsError::OracleObservationMissing)
+    );
+}
+
+#[test]
+fn test_mint_rejects_invalid_observations() {
+    let t = setup_oracle_env();
+    let minter = funded_minter(&t);
+    t.client.set_oracle_max_age(&MAX_AGE);
+
+    // Non-positive price, zero timestamp, and a timestamp from the future.
+    for (price, observed_at) in [
+        (0, NOW),
+        (-5, NOW),
+        (100_000_000, 0),
+        (100_000_000, NOW + 1),
+    ] {
+        t.oracle.set_price(&t.underlying, &price, &observed_at);
+        assert_eq!(
+            try_mint_call(&t, &minter),
+            Err(crate::OptionsError::InvalidPrice),
+            "price {price} observed_at {observed_at}"
+        );
+    }
+}
+
+#[test]
+fn test_put_requires_fresh_observation_for_quote_collateral_too() {
+    let t = setup_oracle_env();
+    let minter = funded_minter(&t);
+    t.client.set_oracle_max_age(&MAX_AGE);
+    let mint_put = || {
+        t.client.try_mint(
+            &minter,
+            &OptionType::Put,
+            &t.underlying,
+            &t.quote,
+            &100_000_000_i128,
+            &500u64,
+            &1000u64,
+            &10_000_000_i128,
+        )
+    };
+
+    // Underlying is fresh but the quote (collateral) asset has no observation.
+    t.oracle.set_price(&t.underlying, &100_000_000, &NOW);
+    assert_eq!(
+        mint_put(),
+        Err(Ok(crate::OptionsError::OracleObservationMissing))
+    );
+
+    // Quote asset observed, but stale.
+    t.oracle
+        .set_price(&t.quote, &10_000_000, &(NOW - MAX_AGE - 1));
+    assert_eq!(
+        mint_put(),
+        Err(Ok(crate::OptionsError::StaleOracleObservation))
+    );
+
+    t.oracle.set_price(&t.quote, &10_000_000, &(NOW - 1));
+    assert_eq!(mint_put(), Ok(Ok(1)));
+}
+
+#[test]
+fn test_oracle_max_age_admin_controls() {
+    let t = setup_oracle_env();
+    let minter = funded_minter(&t);
+
+    assert_eq!(
+        t.client.try_set_oracle_max_age(&0),
+        Err(Ok(crate::OptionsError::InvalidMaxAge))
+    );
+    assert_eq!(t.client.get_oracle_max_age(), None);
+
+    t.client.set_oracle_max_age(&MAX_AGE);
+    // Only the admin may change the guard.
+    assert_eq!(t.env.auths()[0].0, t.admin);
+
+    // Clearing the guard lets mint ignore the (missing) observation again.
+    assert_eq!(
+        try_mint_call(&t, &minter),
+        Err(crate::OptionsError::OracleObservationMissing)
+    );
+    t.client.clear_oracle_max_age();
+    assert_eq!(t.client.get_oracle_max_age(), None);
+    assert_eq!(try_mint_call(&t, &minter), Ok(1));
+}
+
+#[test]
+fn test_oracle_max_age_requires_initialization() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = OptionsContractClient::new(&env, &env.register(OptionsContract, ()));
+
+    assert_eq!(
+        client.try_set_oracle_max_age(&MAX_AGE),
+        Err(Ok(crate::OptionsError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_clear_oracle_max_age(),
+        Err(Ok(crate::OptionsError::NotInitialized))
+    );
+}
