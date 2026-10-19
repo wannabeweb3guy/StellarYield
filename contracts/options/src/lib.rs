@@ -1,7 +1,9 @@
 #mo_std
 [allow(clippy::too_many_arguments)]
 
-use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, token, Address, Env};
+use soroban_sdk::{
+    contract, contractclient, contracterror, contractimpl, symbol_short, token, Address, Env,
+};
 
 mod math;
 mod storage;
@@ -10,12 +12,12 @@ mod tests;
 
 use math::black_scholes_call;
 use storage::{
-    has_admin, read_admin, read_exercised_amount, read_free_collateral, read_option,
-    read_option_counter, read_reserved_collateral, read_storage_version, write_admin,
-    write_exercised_amount, write_free_collateral, write_option, write_option_counter,
-    write_oracle, write_reserved_collateral, write_storage_version, OptionData, OptionType,
-    CURRENT_STORAGE_VERSION,
-    release_reserved,
+    clear_oracle_max_age, has_admin, read_admin, read_exercised_amount, read_free_collateral,
+    read_option, read_option_counter, read_oracle, read_oracle_max_age, read_reserved_collateral,
+    read_storage_version, release_reserved, write_admin, write_exercised_amount,
+    write_free_collateral, write_option, write_option_counter, write_oracle,
+    write_oracle_max_age, write_reserved_collateral, write_storage_version, OptionData,
+    OptionType, CURRENT_STORAGE_VERSION,
 };
 
 #[contracterror]
@@ -43,6 +45,21 @@ pub enum OptionsError {
     ExceedsCollateral = 14,
     /// Collateral accounting overflowed.
     MathOverflow = 15,
+    /// The oracle has no observation for an asset the option depends on.
+    OracleObservationMissing = 16,
+    /// The oracle's latest observation is older than the configured maximum age.
+    StaleOracleObservation = 17,
+    /// The oracle guard max age must be greater than zero.
+    InvalidMaxAge = 18,
+}
+
+/// Price source consulted when the oracle guard is enabled. `get_price`
+/// returns the latest `(price, observed_at)` for an asset, or `None` when the
+/// oracle has no observation for it.
+#[contractclient(name = "OracleClient")]
+#[allow(dead_code)]
+pub trait OracleInterface {
+    fn get_price(env: Env, asset: Address) -> Option<(i128, u64)>;
 }
 
 #[soroban_sdk_derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +105,36 @@ impl OptionsContract {
         Ok()
     }
 
+    /// Enables the oracle guard: `mint` then requires a fresh observation from
+    /// the configured oracle for every asset the option depends on. Admin only.
+    /// Until set, `mint` does not consult the oracle.
+    pub fn set_oracle_max_age(env: Env, max_age: u64) -> Result<(), OptionsError> {
+        if !has_admin(&env) {
+            return Err(OptionsError::NotInitialized);
+        }
+        read_admin(&env).require_auth();
+        if max_age == 0 {
+            return Err(OptionsError::InvalidMaxAge);
+        }
+        write_oracle_max_age(&env, max_age);
+        Ok(())
+    }
+
+    /// Disables the oracle guard. Admin only.
+    pub fn clear_oracle_max_age(env: Env) -> Result<(), OptionsError> {
+        if !has_admin(&env) {
+            return Err(OptionsError::NotInitialized);
+        }
+        read_admin(&env).require_auth();
+        clear_oracle_max_age(&env);
+        Ok(())
+    }
+
+    /// Maximum accepted observation age, or `None` when the guard is off.
+    pub fn get_oracle_max_age(env: Env) -> Option<u64> {
+        read_oracle_max_age(&env)
+    }
+
     pub fn mint(
         env: Env,
         minter: Address,
@@ -115,6 +162,14 @@ impl OptionsContract {
             OptionType::Call => underlying_asset.clone(),
             OptionType::Put => quote_asset.clone(),
         };
+
+        // Price the option and its collateral only from fresh oracle data.
+        if let Some(max_age) = read_oracle_max_age(&env) {
+            require_fresh_observation(&env, &underlying_asset, max_age)?;
+            if collateral_asset != underlying_asset {
+                require_fresh_observation(&env, &collateral_asset, max_age)?;
+            }
+        }
 
         // Back the position with the minter's free (deposited) collateral first and
         // pull only the shortfall from their wallet. Either way the full amount is
@@ -394,4 +449,24 @@ impl OptionsContract {
 
         Ok()
     }
+}
+
+
+/// Requires the configured oracle to hold a valid, recent observation for
+/// `asset`. The observation must exist, carry a positive price, and be
+/// timestamped no later than now and no more than `max_age` seconds ago.
+fn require_fresh_observation(env: &Env, asset: &Address, max_age: u64) -> Result<(), OptionsError> {
+    let oracle = read_oracle(env);
+    let (price, observed_at) = OracleClient::new(env, &oracle)
+        .get_price(asset)
+        .ok_or(OptionsError::OracleObservationMissing)?;
+
+    let now = env.ledger().timestamp();
+    if price <= 0 || observed_at == 0 || observed_at > now {
+        return Err(OptionsError::InvalidPrice);
+    }
+    if now - observed_at > max_age {
+        return Err(OptionsError::StaleOracleObservation);
+    }
+    Ok(())
 }
