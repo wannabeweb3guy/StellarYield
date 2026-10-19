@@ -1,0 +1,18 @@
+{
+  "default_branch": "dev",
+  "branches": [
+    "dev",
+    "fix/issue-1680-bind-stealth-deposit-announcements-to-a-unique",
+    "origin"
+  ],
+  "parent": {
+    "dev": null,
+    "fix/issue-1680-bind-stealth-deposit-announcements-to-a-unique": "dev",
+    "origin": "dev"
+  },
+  "order": [
+    "dev",
+    "fix/issue-1680-bind-stealth-deposit-announcements-to-a-unique",
+    "origin"
+  ]
+}
